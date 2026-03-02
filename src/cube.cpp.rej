@@ -1,0 +1,13 @@
+--- cube.cpp
++++ cube.cpp
+@@ -1,6 +1,8 @@
+ // Two bug fixes — apply with: patch -p1 < cube.patch
+ //
+-// Fix 1: drag artifacts (window ghosts left on desktop)
+-// Fix 2: zoom-to-desktop overshoots (2× scale)
++// Fix 1: Drag artifacts — dirty desktop FBOs too, not just window FBOs.
++//         Also dirty everything on drop.
++// Fix 2: Zoom scale — calculate_close_z() now accounts for output aspect
++//         so the panel fills the screen exactly on both axes.
+ 
+ ===== CHANGE 1 of 3 — in cube_render_instance_t::schedule_instructions() =====

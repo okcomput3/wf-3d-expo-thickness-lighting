@@ -1,0 +1,112 @@
+--- a/cube.cpp
++++ b/cube.cpp
+@@ -1,6 +1,8 @@
+ // Two bug fixes — apply with: patch -p1 < cube.patch
+ //
+-// Fix 1: drag artifacts (window ghosts left on desktop)
+-// Fix 2: zoom-to-desktop overshoots (2× scale)
++// Fix 1: Drag artifacts — dirty desktop FBOs too, not just window FBOs.
++//         Also dirty everything on drop.
++// Fix 2: Zoom scale — calculate_close_z() now accounts for output aspect
++//         so the panel fills the screen exactly on both axes.
+
+ ===== CHANGE 1 of 3 — in cube_render_instance_t::schedule_instructions() =====
+
+ FIND (approximately line where "/* If dragging, force-dirty */" comment is):
+
+             /* If dragging, force-dirty every window FBO that overlaps
+-               the dragged window at current OR previous position */
++               the dragged window at current OR previous position.
++               ALSO dirty the desktop FBOs so window ghosts don't persist. */
+             if (self->drag_active) {
+                 auto og = self->cube->output->get_layout_geometry();
+                 auto grid = self->cube->output->wset()->get_workspace_grid_size();
+                 ...
+                 if (!cur_overlaps && !prev_overlaps) continue;
+-                /* Mark the right FBO dirty */
++                /* Mark BOTH window and desktop FBOs dirty */
+                 if (wy == 0) {
+                     if (wx < (int)ws_dmg_win.size())
+                         ws_dmg_win[wx] |= bb;
++                    if (wx < (int)ws_dmg.size())
++                        ws_dmg[wx] |= bb;
+                 } else {
+                     int r = wy - 1;
+                     if (r < (int)ws_dmg_win_rows.size() &&
+                         wx < (int)ws_dmg_win_rows[r].size())
+                         ws_dmg_win_rows[r][wx] |= bb;
++                    if (r < (int)ws_dmg_rows.size() &&
++                        wx < (int)ws_dmg_rows[r].size())
++                        ws_dmg_rows[r][wx] |= bb;
+                 }
+
+
+ ===== CHANGE 2 of 3 — in cube_render_node_t: add damage_all_workspace_desktops() =====
+
+ Add this method right after damage_all_workspace_windows():
+
++        void damage_all_workspace_desktops()
++        {
++            for (auto& n : ws)
++                wf::scene::damage_node(n, n->get_bounding_box());
++            for (auto& r : ws_all_rows)
++                for (auto& n : r)
++                    wf::scene::damage_node(n, n->get_bounding_box());
++        }
+
+
+ ===== CHANGE 3 of 3 — in handle_pointer_button(), BTN_LEFT RELEASED, on drop =====
+
+ FIND:
+                     if (render_node) {
+                         auto cn = std::dynamic_pointer_cast<cube_render_node_t>(render_node);
+                         if (cn) {
+                             cn->drag_active = false;
+                             cn->damage_all_workspace_windows();
+                         }
+                     }
+
+ REPLACE WITH:
+                     if (render_node) {
+                         auto cn = std::dynamic_pointer_cast<cube_render_node_t>(render_node);
+                         if (cn) {
+                             cn->drag_active = false;
+                             cn->damage_all_workspace_windows();
++                            cn->damage_all_workspace_desktops();
+                         }
+                     }
+
+
+ ===== CHANGE 4 of 4 — calculate_close_z(): exact desktop fit =====
+
+ FIND AND REPLACE the entire calculate_close_z() method:
+
+-    float calculate_close_z()
+-    {
+-        float half_fov = glm::radians(22.5f);  /* half of 45° perspective */
+-        /* projection aspect=1.0, output_transform maps NDC to framebuffer,
+-           so panel fills screen when its half-height matches the visible
+-           half-height at distance Z.  No aspect correction needed here. */
+-        float needed_z = (PANEL_SCALE * 0.5f) / std::tan(half_fov);
+-        return needed_z * 1.02f;
+-    }
+
++    float calculate_close_z()
++    {
++        // The projection uses aspect=1.0.  output_transform then maps the
++        // square NDC space onto the physical framebuffer (which is NOT square).
++        // So to fill the screen exactly we must satisfy both axes:
++        //
++        //   Z_height = (PANEL_SCALE/2) / tan(fov/2)          (fills height)
++        //   Z_width  = (PANEL_SCALE/2) / (tan(fov/2)*aspect) (fills width)
++        //
++        // For landscape (aspect>1): Z_width < Z_height, so Z_width is the
++        // binding constraint — use it so neither axis overflows.
++        float half_fov  = glm::radians(22.5f);
++        float tan_hfov  = std::tan(half_fov);
++        auto  og        = output->get_layout_geometry();
++        float aspect    = (float)og.width / (float)og.height;
++        float z_height  = (PANEL_SCALE * 0.5f) / tan_hfov;
++        float z_width   = (PANEL_SCALE * 0.5f) / (tan_hfov * aspect);
++        return std::min(z_height, z_width);   // exact fit, no fudge factor
++    }
