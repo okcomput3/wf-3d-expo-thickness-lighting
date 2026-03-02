@@ -61,7 +61,7 @@
 #define CULL_PX        8.0f
 
 /* 3D BOX DEPTH — thickness of each workspace cuboid */
-#define BOX_DEPTH      0.08f
+#define BOX_DEPTH      0.32f
 
 /* OPT B: max FBO renders per frame (staggered) */
 #define MAX_FBO_RENDERS_PER_FRAME 999
@@ -73,6 +73,9 @@
 
 /* OPT M: pointer dedup threshold (squared pixels) */
 #define POINTER_DEDUP_DIST_SQ  0.5f
+
+#define CORNER_RADIUS   0.06f
+#define CORNER_SEGMENTS 8
 
 /* ─── HSV to RGB helper ─────────────────────────────────────────────────── */
 static glm::vec3 hsv2rgb(float h, float s, float v)
@@ -135,7 +138,7 @@ uniform mat4 MVP;
 varying vec2 v_uv;
 void main() {
     v_uv = uvPosition;
-    gl_Position = MVP * vec4(position, 0.0, 1.0);
+    gl_Position = MVP * vec4(position, 0.005, 1.0);
 })";
 static const char *panel_fs = R"(
 #version 100
@@ -467,7 +470,9 @@ static const char *silhouette_vs = R"(
 attribute vec3 a_position;
 uniform mat4 MVP;
 void main() {
-    gl_Position = MVP * vec4(a_position, 1.0);
+    vec3 pos = a_position;
+    if (pos.z > -0.001) pos.z = 0.005;
+    gl_Position = MVP * vec4(pos, 1.0);
 })";
 static const char *silhouette_fs = R"(
 #version 100
@@ -575,6 +580,9 @@ class wayfire_cube : public wf::per_output_plugin_instance_t,
     bool has_virtual_hit = false;
     glm::vec3 virtual_ray_hit_pos{0};
     int hit_workspace_x = -1, hit_workspace_y = -1;
+
+       int front_index_count = 0;
+    int sides_index_count = 0;
 
     wf::animation::simple_animation_t popout_scale_animation{wf::create_option<int>(300)};
     wf::animation::simple_animation_t camera_y_offset{wf::create_option<int>(600)};
@@ -735,6 +743,242 @@ void ensure_postprocess_fbos(int w, int h)
         float dw = fx * (cached_total_w * 0.5f);
         cached_overview_z = std::max(dh, dw) * 1.00f;
         models_dirty = true;
+    }
+
+    void generate_rounded_box_geometry()
+    {
+        float hw = 0.5f, hh = 0.5f;
+        float D = BOX_DEPTH;
+        float r = std::min(CORNER_RADIUS, std::min(hw, hh) * 0.9f);
+        int segs = CORNER_SEGMENTS;
+
+        /* ─── Build perimeter points + outward normals ──────────── */
+        struct PP { float x, y, nx, ny; };
+        std::vector<PP> perim;
+
+        struct Corner { float cx, cy, start; };
+        Corner corners[4] = {
+            { hw - r,  hh - r, 0.0f },
+            {-hw + r,  hh - r, (float)M_PI * 0.5f },
+            {-hw + r, -hh + r, (float)M_PI },
+            { hw - r, -hh + r, (float)M_PI * 1.5f },
+        };
+
+        for (int c = 0; c < 4; c++) {
+            for (int s = 0; s <= segs; s++) {
+                float t = (float)s / segs;
+                float angle = corners[c].start + t * (float)M_PI * 0.5f;
+                float nx = std::cos(angle);
+                float ny = std::sin(angle);
+                perim.push_back({
+                    corners[c].cx + nx * r,
+                    corners[c].cy + ny * r,
+                    nx, ny
+                });
+            }
+        }
+
+        int N = (int)perim.size();
+
+        /* ═══════════════════════════════════════════════════════════
+         *  FRONT FACE: rounded rect with UVs (pos2 + uv2)
+         *  Triangle fan from center
+         * ═══════════════════════════════════════════════════════════*/
+        std::vector<GLfloat> fv;
+        std::vector<GLuint> fi;
+
+        /* Center vertex */
+        fv.push_back(0.0f); fv.push_back(0.0f);   /* pos */
+        fv.push_back(0.5f); fv.push_back(0.5f);   /* uv  */
+
+        for (int i = 0; i < N; i++) {
+            fv.push_back(perim[i].x);
+            fv.push_back(perim[i].y);
+            fv.push_back(perim[i].x / (2.0f * hw) + 0.5f);
+            fv.push_back(perim[i].y / (2.0f * hh) + 0.5f);
+        }
+
+        for (int i = 0; i < N; i++) {
+            fi.push_back(0);
+            fi.push_back(1 + i);
+            fi.push_back(1 + (i + 1) % N);
+        }
+
+        front_index_count = (int)fi.size();
+
+        if (panel_vbo) { GL_CALL(glDeleteBuffers(1, &panel_vbo)); panel_vbo = 0; }
+        if (panel_ibo) { GL_CALL(glDeleteBuffers(1, &panel_ibo)); panel_ibo = 0; }
+
+        GL_CALL(glGenBuffers(1, &panel_vbo));
+        GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, panel_vbo));
+        GL_CALL(glBufferData(GL_ARRAY_BUFFER,
+            fv.size() * sizeof(GLfloat), fv.data(), GL_STATIC_DRAW));
+
+        GL_CALL(glGenBuffers(1, &panel_ibo));
+        GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, panel_ibo));
+        GL_CALL(glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            fi.size() * sizeof(GLuint), fi.data(), GL_STATIC_DRAW));
+
+        /* ═══════════════════════════════════════════════════════════
+         *  SIDE STRIP + BACK FACE (pos3 + normal3)
+         *
+         *  Side: front perimeter → back perimeter with outward normals
+         *  Front bevel: curved transition from front face to side
+         *  Back bevel:  curved transition from side to back face
+         *  Back face:   flat rounded rect at z = -D
+         * ═══════════════════════════════════════════════════════════*/
+        std::vector<GLfloat> sv;
+        std::vector<GLuint> si;
+
+        int bevel_segs = 4;
+        float bevel_r = D * 0.4f;  /* how much of the depth is curved */
+        float flat_depth = D - bevel_r * 2.0f;
+        if (flat_depth < 0.0f) {
+            bevel_r = D * 0.5f;
+            flat_depth = 0.0f;
+        }
+
+        /* For each perimeter point, generate a profile curve:
+         *   front face edge (z=0) → bevel out → straight side → bevel in → back face (z=-D)
+         *
+         *   Profile goes:
+         *     Ring 0: z=0,          normal = (0,0,1) blended with outward
+         *     Ring 1..bevel_segs:   front bevel curve
+         *     Ring bevel_segs+1:    straight side start (z = -bevel_r)
+         *     Ring bevel_segs+2:    straight side end   (z = -(D-bevel_r))
+         *     Ring bevel_segs+3..+3+bevel_segs: back bevel curve
+         *     Ring last:            z=-D, normal = (0,0,-1) blended with outward
+         */
+
+        int rings = 2 + bevel_segs * 2 + 2;  /* total rings in the profile */
+
+        struct Ring { float z_off; float nx_blend; float nz; };
+        std::vector<Ring> profile;
+
+        /* Front bevel */
+        for (int s = 0; s <= bevel_segs; s++) {
+            float t = (float)s / bevel_segs;
+            float angle = (float)M_PI * 0.5f * (1.0f - t);  /* 90° → 0° */
+            float bx = std::cos(angle) * bevel_r;
+            float bz = (1.0f - std::sin(angle)) * bevel_r;
+            /* Normal: blend between forward (0,0,1) and outward */
+            float n_out = std::cos(angle - (float)M_PI * 0.5f);
+            float n_fwd = std::sin(angle - (float)M_PI * 0.5f);
+            /* Actually compute from the curve tangent */
+            float tnx = std::sin(angle);   /* outward component */
+            float tnz = std::cos(angle);   /* forward component */
+            profile.push_back({-bz, tnx, tnz});
+        }
+
+        /* Straight side */
+        profile.push_back({-bevel_r, 1.0f, 0.0f});
+        if (flat_depth > 0.001f) {
+            profile.push_back({-(bevel_r + flat_depth), 1.0f, 0.0f});
+        }
+
+        /* Back bevel */
+        for (int s = 0; s <= bevel_segs; s++) {
+            float t = (float)s / bevel_segs;
+            float angle = (float)M_PI * 0.5f * t;  /* 0° → 90° */
+            float bz = bevel_r + flat_depth +
+                       (1.0f - std::cos(angle)) * bevel_r;
+            float tnx = std::cos(angle);
+            float tnz = -std::sin(angle);  /* pointing backward */
+            profile.push_back({-bz, tnx, tnz});
+        }
+
+        int num_rings = (int)profile.size();
+
+        /* Generate vertices: N perimeter points × num_rings rings */
+        for (int ring = 0; ring < num_rings; ring++) {
+            auto& pr = profile[ring];
+            for (int i = 0; i < N; i++) {
+                /* Position: perimeter XY + profile Z offset */
+                /* For bevel, push outward slightly based on profile */
+                float bevel_expand = 0.0f;
+                if (ring < (int)profile.size()) {
+                    /* The bevel curve pushes geometry inward from the edge
+                       to create the rounded profile */
+                    if (ring <= bevel_segs) {
+                        float t = (float)ring / bevel_segs;
+                        float angle = (float)M_PI * 0.5f * (1.0f - t);
+                        bevel_expand = -(bevel_r - std::cos(angle) * bevel_r);
+                    } else if (ring >= num_rings - bevel_segs - 1) {
+                        int br = ring - (num_rings - bevel_segs - 1);
+                        float t = (float)br / bevel_segs;
+                        float angle = (float)M_PI * 0.5f * t;
+                        bevel_expand = -(bevel_r - std::cos(angle) * bevel_r);
+                    }
+                }
+
+                float px = perim[i].x + perim[i].nx * bevel_expand;
+                float py = perim[i].y + perim[i].ny * bevel_expand;
+                float pz = pr.z_off;
+
+                /* Normal: combine perimeter outward with profile Z component */
+                float fnx = perim[i].nx * pr.nx_blend;
+                float fny = perim[i].ny * pr.nx_blend;
+                float fnz = pr.nz;
+                float nlen = std::sqrt(fnx*fnx + fny*fny + fnz*fnz);
+                if (nlen > 0.001f) { fnx /= nlen; fny /= nlen; fnz /= nlen; }
+
+                sv.push_back(px);  sv.push_back(py);  sv.push_back(pz);
+                sv.push_back(fnx); sv.push_back(fny); sv.push_back(fnz);
+            }
+        }
+
+        /* Side strip indices: connect adjacent rings */
+        for (int ring = 0; ring < num_rings - 1; ring++) {
+            for (int i = 0; i < N; i++) {
+                int next = (i + 1) % N;
+                int r0i = ring * N + i;
+                int r0n = ring * N + next;
+                int r1i = (ring + 1) * N + i;
+                int r1n = (ring + 1) * N + next;
+
+                si.push_back(r0i); si.push_back(r1i); si.push_back(r0n);
+                si.push_back(r0n); si.push_back(r1i); si.push_back(r1n);
+            }
+        }
+
+        /* Back face: triangle fan at z = -D with normal (0,0,-1) */
+        int back_center = (int)(sv.size() / 6);
+        sv.push_back(0.0f); sv.push_back(0.0f); sv.push_back(-D);
+        sv.push_back(0.0f); sv.push_back(0.0f); sv.push_back(-1.0f);
+
+        /* Back perimeter vertices (inset by bevel) */
+        float back_inset = bevel_r;  /* back bevel pulls edge inward */
+        for (int i = 0; i < N; i++) {
+            float px = perim[i].x - perim[i].nx * back_inset;
+            float py = perim[i].y - perim[i].ny * back_inset;
+            sv.push_back(px);   sv.push_back(py);   sv.push_back(-D);
+            sv.push_back(0.0f); sv.push_back(0.0f); sv.push_back(-1.0f);
+        }
+
+        /* Back face triangles (reversed winding) */
+        for (int i = 0; i < N; i++) {
+            si.push_back(back_center);
+            si.push_back(back_center + 1 + (i + 1) % N);
+            si.push_back(back_center + 1 + i);
+        }
+
+        sides_index_count = (int)si.size();
+
+        if (box_sides_vbo) { GL_CALL(glDeleteBuffers(1, &box_sides_vbo)); box_sides_vbo = 0; }
+        if (box_sides_ibo) { GL_CALL(glDeleteBuffers(1, &box_sides_ibo)); box_sides_ibo = 0; }
+
+        GL_CALL(glGenBuffers(1, &box_sides_vbo));
+        GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
+        GL_CALL(glBufferData(GL_ARRAY_BUFFER,
+            sv.size() * sizeof(GLfloat), sv.data(), GL_STATIC_DRAW));
+
+        GL_CALL(glGenBuffers(1, &box_sides_ibo));
+        GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, box_sides_ibo));
+        GL_CALL(glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+            si.size() * sizeof(GLuint), si.data(), GL_STATIC_DRAW));
+
+        GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
+        GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
     }
 
     void rebuild_model_cache(int gw, int gh)
@@ -1579,64 +1823,8 @@ void ensure_postprocess_fbos(int w, int h)
                 sizeof(data),data,GL_STATIC_DRAW));
         }
 
-        /* Front face IBO */
-        if (!panel_ibo) {
-            static const GLuint idx[] = {0,1,2,0,2,3};
-            GL_CALL(glGenBuffers(1,&panel_ibo));
-            GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,panel_ibo));
-            GL_CALL(glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                sizeof(idx),idx,GL_STATIC_DRAW));
-        }
-
-        /* ═══════════════════════════════════════════════════════════════
-         * 3D BOX SIDES + BACK GEOMETRY
-         *
-         * 5 faces (back, left, right, top, bottom), 4 verts each = 20 verts
-         * Each vertex: pos(3) + normal(3) = 6 floats
-         * Unit box: XY in [-0.5, 0.5], Z from 0 (front) to -BOX_DEPTH (back)
-         * ═══════════════════════════════════════════════════════════════*/
-        if (!box_sides_vbo) {
-            const float D = BOX_DEPTH;
-            /* clang-format off */
-            static const GLfloat verts[] = {
-                /* ── Back face (z = -D, normal toward -Z) ────────── */
-                /* v0 */ -0.5f,  0.5f, -D,    0, 0, -1,
-                /* v1 */  0.5f,  0.5f, -D,    0, 0, -1,
-                /* v2 */  0.5f, -0.5f, -D,    0, 0, -1,
-                /* v3 */ -0.5f, -0.5f, -D,    0, 0, -1,
-
-                /* ── Left face (x = -0.5, normal toward -X) ─────── */
-                /* v4 */ -0.5f,  0.5f,  0,   -1, 0,  0,
-                /* v5 */ -0.5f,  0.5f, -D,   -1, 0,  0,
-                /* v6 */ -0.5f, -0.5f, -D,   -1, 0,  0,
-                /* v7 */ -0.5f, -0.5f,  0,   -1, 0,  0,
-
-                /* ── Right face (x = 0.5, normal toward +X) ─────── */
-                /* v8  */  0.5f,  0.5f,  0,    1, 0,  0,
-                /* v9  */  0.5f, -0.5f,  0,    1, 0,  0,
-                /* v10 */  0.5f, -0.5f, -D,    1, 0,  0,
-                /* v11 */  0.5f,  0.5f, -D,    1, 0,  0,
-
-                /* ── Top face (y = 0.5, normal toward +Y) ──────── */
-                /* v12 */ -0.5f,  0.5f,  0,    0, 1,  0,
-                /* v13 */  0.5f,  0.5f,  0,    0, 1,  0,
-                /* v14 */  0.5f,  0.5f, -D,    0, 1,  0,
-                /* v15 */ -0.5f,  0.5f, -D,    0, 1,  0,
-
-                /* ── Bottom face (y = -0.5, normal toward -Y) ──── */
-                /* v16 */ -0.5f, -0.5f,  0,    0,-1,  0,
-                /* v17 */ -0.5f, -0.5f, -D,    0,-1,  0,
-                /* v18 */  0.5f, -0.5f, -D,    0,-1,  0,
-                /* v19 */  0.5f, -0.5f,  0,    0,-1,  0,
-            };
-            /* clang-format on */
-
-            GL_CALL(glGenBuffers(1, &box_sides_vbo));
-            GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
-            GL_CALL(glBufferData(GL_ARRAY_BUFFER,
-                sizeof(verts), verts, GL_STATIC_DRAW));
-        }
-
+  generate_rounded_box_geometry();
+  
         /* Box sides IBO: 5 faces × 6 indices = 30 */
         if (!box_sides_ibo) {
             static const GLuint idx[] = {
@@ -1951,6 +2139,10 @@ void draw_box_sides(const glm::mat4& mvp, const glm::mat4& model,
                     const glm::vec3& color1, const glm::vec3& color2,
                     const DynamicLight& light)
 {
+
+    GL_CALL(glEnable(GL_CULL_FACE));
+        GL_CALL(glCullFace(GL_BACK));
+
     box_color_program.use(wf::TEXTURE_TYPE_RGBA);
     GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
     GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, box_sides_ibo));
@@ -1990,11 +2182,14 @@ void draw_box_sides(const glm::mat4& mvp, const glm::mat4& model,
         light.accent_color.x, light.accent_color.y, light.accent_color.z);
     box_color_program.uniform1f("u_time", light.time);
 
-    GL_CALL(glDrawElements(GL_TRIANGLES, 30, GL_UNSIGNED_INT, nullptr));
+        /* Draw all side + back faces */
+        GL_CALL(glDrawElements(GL_TRIANGLES, sides_index_count,
+            GL_UNSIGNED_INT, nullptr));
 
     GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
     GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
     box_color_program.deactivate();
+     GL_CALL(glDisable(GL_CULL_FACE));
 }
 
     /* ═════════════════════════════════════════════════════════════════════
@@ -2028,22 +2223,25 @@ void draw_box_sides(const glm::mat4& mvp, const glm::mat4& model,
 
 void draw_box_silhouette(const glm::mat4& mvp)
     {
-        /* Draw front face as black quad */
         silhouette_program.use(wf::TEXTURE_TYPE_RGBA);
+
+        /* Front face silhouette */
         GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, panel_vbo));
         GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, panel_ibo));
         silhouette_program.attrib_pointer("a_position", 2,
             4*sizeof(GLfloat), (void*)0);
         silhouette_program.uniformMatrix4f("MVP", mvp);
-        GL_CALL(glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr));
+        GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count,
+            GL_UNSIGNED_INT, nullptr));
 
-        /* Draw box sides as black */
+        /* Sides + back silhouette */
         GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
         GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, box_sides_ibo));
         silhouette_program.attrib_pointer("a_position", 3,
             6*sizeof(GLfloat), (void*)0);
         silhouette_program.uniformMatrix4f("MVP", mvp);
-        GL_CALL(glDrawElements(GL_TRIANGLES, 30, GL_UNSIGNED_INT, nullptr));
+        GL_CALL(glDrawElements(GL_TRIANGLES, sides_index_count,
+            GL_UNSIGNED_INT, nullptr));
 
         GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
         GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
@@ -2164,6 +2362,13 @@ void draw_box_silhouette(const glm::mat4& mvp)
                         bright *= std::max(0.0f, 1.0f - fade);
                     }
 
+                               float swing_phase = (float)(wx * 3 + wy * 7) * 1.618f;
+                    float swing_angle = glm::radians(17.5f) *
+                        std::sin(elapsed * 0.4f + swing_phase) * (1.0f - t);
+                    sm = glm::rotate(sm, swing_angle, glm::vec3(0.0f, 1.0f, 0.0f));
+
+                    
+
                     panels.push_back({idx, wx, wy, pdepth, bright,
                                       sm, vp * sm});
                 }
@@ -2206,7 +2411,14 @@ void draw_box_silhouette(const glm::mat4& mvp)
                 draw_box_silhouette(pd.scatter_mvp);
             }
             if (target_idx >= 0) {
-                glm::mat4 tmvp = vp * cached_models[target_idx];
+                glm::mat4 tmodel = cached_models[target_idx];
+                float swing_phase = (float)(zoom_target_ws.x * 3 +
+                                            zoom_target_ws.y * 7) * 1.618f;
+                float swing_angle = glm::radians(17.5f) *
+                        std::sin(elapsed * 0.4f + swing_phase) * (1.0f - t);
+                tmodel = glm::rotate(tmodel, swing_angle,
+                                     glm::vec3(0.0f, 1.0f, 0.0f));
+                glm::mat4 tmvp = vp * tmodel;
                 draw_box_silhouette(tmvp);
             }
 
@@ -2290,8 +2502,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
                 GL_CALL(glBindTexture(GL_TEXTURE_2D, tex.tex_id));
                 program.uniformMatrix4f("MVP", pd.scatter_mvp);
                 program.uniform1f("u_brightness", face_bright);
-                GL_CALL(glDrawElements(GL_TRIANGLES, 6,
-                    GL_UNSIGNED_INT, nullptr));
+                GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count, GL_UNSIGNED_INT, nullptr));
                 GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
                 GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
                 GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
@@ -2302,7 +2513,16 @@ void draw_box_silhouette(const glm::mat4& mvp)
             if (target_idx >= 0) {
                 auto& st = states[target_idx];
                 if (st.allocated) {
-                    const glm::mat4& model = cached_models[target_idx];
+                   
+                    glm::mat4 model = cached_models[target_idx];
+
+                    float swing_phase = (float)(zoom_target_ws.x * 3 +
+                                                zoom_target_ws.y * 7) * 1.618f;
+                    float swing_angle = glm::radians(17.5f) *
+                        std::sin(elapsed * 0.4f + swing_phase) * (1.0f - t);
+                    model = glm::rotate(model, swing_angle,
+                                        glm::vec3(0.0f, 1.0f, 0.0f));
+
                     glm::mat4 mvp = vp * model;
 
                     glm::vec3 c1, c2;
@@ -2325,8 +2545,9 @@ void draw_box_silhouette(const glm::mat4& mvp)
                 auto tex = wf::gles_texture_t::from_aux(st.fb);
                 GL_CALL(glBindTexture(GL_TEXTURE_2D, tex.tex_id));
                 program.uniformMatrix4f("MVP",mvp);  /* or mvp for target */
-                GL_CALL(glDrawElements(GL_TRIANGLES, 6,
-                    GL_UNSIGNED_INT, nullptr));
+                GL_CALL(glEnable(GL_POLYGON_OFFSET_FILL));
+                GL_CALL(glPolygonOffset(-1.0f, -1.0f));
+                GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count, GL_UNSIGNED_INT, nullptr));
 
                 GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));  /* restore */
 
