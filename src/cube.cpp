@@ -327,17 +327,18 @@ static const char *godrays_fs = R"(
 precision highp float;
 varying vec2 v_uv;
 uniform sampler2D u_scene;
-uniform vec2  u_light_screen;   /* light pos in UV [0,1] space */
+uniform vec2  u_light_screen;
 uniform float u_density;
 uniform float u_weight;
 uniform float u_decay;
 uniform float u_exposure;
 uniform float u_intensity;
 
-const int NUM_SAMPLES = 48;
+const int NUM_SAMPLES = 96;
 
 void main() {
     vec2 dir = v_uv - u_light_screen;
+    float dist_to_light = length(dir);
     dir *= 1.0 / float(NUM_SAMPLES) * u_density;
 
     vec2 tc = v_uv;
@@ -348,19 +349,25 @@ void main() {
         tc -= dir;
         vec3 s = texture2D(u_scene, clamp(tc, 0.0, 1.0)).rgb;
 
-        /* Only gather bright pixels */
+        /* Smooth luminance threshold */
         float lum = dot(s, vec3(0.299, 0.587, 0.114));
-        s *= smoothstep(0.3, 0.8, lum);
+        s *= smoothstep(0.1, 0.5, lum);
 
-        s *= illumination_decay * u_weight;
+        /* Distance-based weight — rays nearer to light are stronger */
+        float sample_dist = length(tc - u_light_screen);
+        float dist_weight = exp(-sample_dist * 0.8);
+
+        s *= illumination_decay * u_weight * dist_weight;
         color += s;
         illumination_decay *= u_decay;
     }
 
-    color *= u_exposure * u_intensity;
+    /* Smooth radial falloff from light source */
+    float radial_fade = exp(-dist_to_light * dist_to_light * 0.5);
+    color *= u_exposure * u_intensity * (0.5 + 0.5 * radial_fade);
+
     gl_FragColor = vec4(color, 1.0);
 })";
-
 /* ─── Bloom extract + blur ──────────────────────────────────────────── */
 static const char *bloom_extract_fs = R"(
 #version 100
@@ -498,27 +505,52 @@ precision highp float;
 varying vec2 v_uv;
 uniform vec3  u_color;
 uniform float u_time;
+
 void main() {
     float d = length(v_uv);
-
-    /* Discard pixels outside the circle */
     if (d > 0.1) discard;
 
-    /* Large soft bright disc */
-    float core = exp(-d * 2.0) * 2.0;
-    float glow = exp(-d * 0.8) * 1.0;
-    float outer = exp(-d * 0.3) * 0.4;
+    /* Ray march through a soft volume */
+    vec3 col = vec3(0.0);
+    float density_accum = 0.0;
 
-    /* Smooth fade to zero at edge */
-    float edge = 1.0 - smoothstep(0.7, 1.0, d);
+    const int STEPS = 32;
+    float step_size = 1.0 / float(STEPS);
 
-    /* Subtle pulse */
-    float pulse = 0.9 + 0.1 * sin(u_time * 2.5);
+    for (int i = 0; i < STEPS; i++) {
+        float t = float(i) * step_size;
 
-    float total = (core + glow + outer) * pulse * edge;
-    vec3 col = u_color * total;
+        /* Spherical volume density — smooth Gaussian */
+        float r = d * (0.3 + t * 0.7);
+        float density = exp(-r * r * 3.0) * step_size;
 
-    gl_FragColor = vec4(col, total);
+        /* Depth-based color shift: warm core, cool edges */
+        vec3 layer_color = mix(
+            vec3(1.0, 0.95, 0.9),   /* warm white core */
+            u_color,                  /* user color at edges */
+            smoothstep(0.0, 0.6, r)
+        );
+
+        /* Absorption — deeper layers are dimmer */
+        float absorption = exp(-density_accum * 2.0);
+        col += layer_color * density * absorption * 3.0;
+        density_accum += density;
+    }
+
+    /* Subtle caustic ripple */
+    float caustic = sin(d * 15.0 - u_time * 2.0) * 0.03 *
+                    exp(-d * 3.0);
+    col += u_color * caustic;
+
+    /* Smooth radial fade */
+    float edge = 1.0 - smoothstep(0.5, 1.0, d);
+    col *= edge;
+
+    float pulse = 0.92 + 0.08 * sin(u_time * 2.5);
+    col *= pulse;
+
+    float alpha = clamp(density_accum * 4.0 * edge, 0.0, 1.0);
+    gl_FragColor = vec4(col, alpha);
 })";
 /* ═══════════════════════════════════════════════════════════════════════════
  *  SCREEN-SIZE HELPER  (draw-call culling + LOD)
@@ -589,6 +621,22 @@ class wayfire_cube : public wf::per_output_plugin_instance_t,
 
     enum class ZoomState { OVERVIEW, ZOOMING_IN, ZOOMED_IN, ZOOMING_OUT };
     ZoomState zoom_state = ZoomState::OVERVIEW;
+
+        struct PanelPhysics {
+        glm::vec3 offset{0};       /* displacement from grid position */
+        glm::vec3 velocity{0};
+        float angular_vel = 0.0f;   /* Y-axis spin */
+        float angle = 0.0f;
+        float angular_vel_z = 0.0f; /* Z-axis tumble */
+        float angle_z = 0.0f;
+        bool falling = false;
+        bool returning = false;
+        bool at_rest = true;
+    };
+    std::vector<PanelPhysics> panel_physics;
+    bool physics_triggered = false;
+      float floor_y = 3.0f;
+
 
     struct ZoomAnim {
         bool running = false;
@@ -672,7 +720,7 @@ GLuint pp_occlude_tex = 0, pp_occlude_fbo = 0;
     glm::mat4 cached_inv_view_scale;
     bool      raycast_cache_dirty = true;
 
-void ensure_postprocess_fbos(int w, int h)
+    void ensure_postprocess_fbos(int w, int h)
     {
         if (pp_width == w && pp_height == h && pp_scene_tex) return;
 
@@ -680,8 +728,8 @@ void ensure_postprocess_fbos(int w, int h)
             if (!tex) { GL_CALL(glGenTextures(1, &tex)); }
             if (!fbo) { GL_CALL(glGenFramebuffers(1, &fbo)); }
             GL_CALL(glBindTexture(GL_TEXTURE_2D, tex));
-            GL_CALL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
-                                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
+            GL_CALL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0,
+                                 GL_RGBA, GL_HALF_FLOAT, nullptr));
             GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
             GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
             GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
@@ -743,6 +791,268 @@ void ensure_postprocess_fbos(int w, int h)
         float dw = fx * (cached_total_w * 0.5f);
         cached_overview_z = std::max(dh, dw) * 1.00f;
         models_dirty = true;
+    }
+
+void update_physics(float dt)
+    {
+        auto grid = output->wset()->get_workspace_grid_size();
+        int gw = grid.width, gh = grid.height;
+        int total = gw * gh;
+
+        if ((int)panel_physics.size() != total)
+            panel_physics.resize(total);
+
+        update_cached_grid_metrics();
+
+        float gravity = 9.8f;
+        float bounciness = 0.15f;
+        float damping = 0.985f;
+        float angular_damping = 0.90f;
+        float return_speed = 4.0f;
+        float return_snap = 0.005f;
+
+        float pw = PANEL_SCALE * cached_aspect;
+        float ph = PANEL_SCALE;
+        float pad = 0.15f;  /* collision padding — keeps panels apart */
+        float cpw = pw + pad;
+        float cph = ph + pad;
+
+        /* ── Integration ───────────────────────────────────────── */
+        for (int idx = 0; idx < total; idx++) {
+            auto& p = panel_physics[idx];
+            int wx = idx % gw, wy = idx / gw;
+
+            if (wx == selected_ws.x && wy == selected_ws.y) {
+                p.offset = glm::vec3(0);
+                p.velocity = glm::vec3(0);
+                p.angle = 0;
+                p.angle_z = 0;
+                p.angular_vel = 0;
+                p.angular_vel_z = 0;
+                p.at_rest = true;
+                continue;
+            }
+
+            if (p.returning) {
+                p.velocity = glm::vec3(0);
+                p.offset = glm::mix(p.offset, glm::vec3(0), return_speed * dt);
+                p.angle = glm::mix(p.angle, 0.0f, return_speed * dt);
+                p.angle_z = glm::mix(p.angle_z, 0.0f, return_speed * dt);
+                if (glm::length(p.offset) < return_snap &&
+                    std::abs(p.angle) < 0.01f &&
+                    std::abs(p.angle_z) < 0.01f) {
+                    p.offset = glm::vec3(0);
+                    p.angle = 0;
+                    p.angle_z = 0;
+                    p.returning = false;
+                    p.at_rest = true;
+                    p.falling = false;
+                }
+                continue;
+            }
+
+            if (!p.falling) continue;
+            p.at_rest = false;
+
+            p.velocity.y += gravity * dt;
+            p.velocity *= damping;
+            p.offset += p.velocity * dt;
+
+            p.angle += p.angular_vel * dt;
+            p.angle_z += p.angular_vel_z * dt;
+            p.angular_vel *= angular_damping;
+            p.angular_vel_z *= angular_damping;
+        }
+
+        /* ── Helpers ───────────────────────────────────────────── */
+        auto get_center = [&](int idx) -> glm::vec2 {
+            int wx = idx % gw, wy = idx / gw;
+            return {
+                cached_ox + wx * cached_cell_w + panel_physics[idx].offset.x,
+               -cached_oy + wy * cached_cell_h + panel_physics[idx].offset.y
+            };
+        };
+
+        auto is_active = [&](int idx) -> bool {
+            int wx = idx % gw, wy = idx / gw;
+            if (wx == selected_ws.x && wy == selected_ws.y) return false;
+            auto& p = panel_physics[idx];
+            return p.falling && !p.returning;
+        };
+
+        /* ── Solve collisions + boundaries together ────────────── */
+        float half_total = cached_total_w * 0.9f;
+
+        for (int iter = 0; iter < 16; iter++) {
+            bool any = false;
+
+            /* Panel-to-panel */
+            for (int i = 0; i < total; i++) {
+                if (!is_active(i)) continue;
+                auto& a = panel_physics[i];
+                glm::vec2 ac = get_center(i);
+
+                for (int j = i + 1; j < total; j++) {
+                    if (!is_active(j)) continue;
+                    auto& b = panel_physics[j];
+                    glm::vec2 bc = get_center(j);
+
+                    float dx = bc.x - ac.x;
+                    float dy = bc.y - ac.y;
+                    float ox = cpw - std::abs(dx);
+                    float oy = cph - std::abs(dy);
+
+                    if (ox <= 0.0f || oy <= 0.0f) continue;
+                    any = true;
+
+                    if (ox < oy) {
+                        float sign = (dx > 0.0f) ? 1.0f : -1.0f;
+                        a.offset.x -= sign * ox * 0.5f;
+                        b.offset.x += sign * ox * 0.5f;
+
+                        float rel = a.velocity.x - b.velocity.x;
+                        if ((dx > 0.0f && rel > 0.0f) ||
+                            (dx < 0.0f && rel < 0.0f)) {
+                            float imp = rel * (1.0f + bounciness) * 0.5f;
+                            a.velocity.x -= imp;
+                            b.velocity.x += imp;
+                            a.angular_vel += imp * 0.05f;
+                            b.angular_vel -= imp * 0.05f;
+                        }
+                    } else {
+                        float sign = (dy > 0.0f) ? 1.0f : -1.0f;
+                        a.offset.y -= sign * oy * 0.5f;
+                        b.offset.y += sign * oy * 0.5f;
+
+                        float rel = a.velocity.y - b.velocity.y;
+                        if ((dy > 0.0f && rel > 0.0f) ||
+                            (dy < 0.0f && rel < 0.0f)) {
+                            float imp = rel * (1.0f + bounciness) * 0.5f;
+                            a.velocity.y -= imp;
+                            b.velocity.y += imp;
+                            a.angular_vel_z += imp * 0.05f;
+                            b.angular_vel_z -= imp * 0.05f;
+                        }
+                    }
+                }
+            }
+
+            /* Selected panel pushes others */
+            {
+                glm::vec2 sc = {
+                    cached_ox + selected_ws.x * cached_cell_w,
+                   -cached_oy + selected_ws.y * cached_cell_h
+                };
+
+                for (int i = 0; i < total; i++) {
+                    if (!is_active(i)) continue;
+                    auto& p = panel_physics[i];
+                    glm::vec2 pc = get_center(i);
+
+                    float dx = pc.x - sc.x;
+                    float dy = pc.y - sc.y;
+                    float ox = cpw - std::abs(dx);
+                    float oy = cph - std::abs(dy);
+
+                    if (ox <= 0.0f || oy <= 0.0f) continue;
+                    any = true;
+
+                    if (ox < oy) {
+                        float sign = (dx > 0.0f) ? 1.0f : -1.0f;
+                        p.offset.x += sign * ox;
+                        if ((dx > 0.0f && p.velocity.x < 0.0f) ||
+                            (dx < 0.0f && p.velocity.x > 0.0f))
+                            p.velocity.x = -p.velocity.x * bounciness;
+                    } else {
+                        float sign = (dy > 0.0f) ? 1.0f : -1.0f;
+                        p.offset.y += sign * oy;
+                        if ((dy > 0.0f && p.velocity.y < 0.0f) ||
+                            (dy < 0.0f && p.velocity.y > 0.0f))
+                            p.velocity.y = -p.velocity.y * bounciness;
+                    }
+                }
+            }
+
+            /* Floor and walls inside the iteration loop */
+            for (int idx = 0; idx < total; idx++) {
+                if (!is_active(idx)) continue;
+                auto& p = panel_physics[idx];
+                glm::vec2 c = get_center(idx);
+
+                float bottom = c.y + ph * 0.5f;
+                if (bottom > floor_y) {
+                    p.offset.y -= (bottom - floor_y);
+                    if (p.velocity.y > 0.0f) {
+                        p.velocity.y = -p.velocity.y * bounciness;
+                        p.velocity.x *= 0.85f;
+                        p.angular_vel_z += p.velocity.x * 0.05f;
+                    }
+                    if (std::abs(p.velocity.y) < 0.15f)
+                        p.velocity.y = 0;
+                    any = true;
+                }
+
+                float left = c.x - pw * 0.5f;
+                if (left < -half_total) {
+                    p.offset.x += (-half_total - left);
+                    if (p.velocity.x < 0.0f)
+                        p.velocity.x = -p.velocity.x * bounciness;
+                    any = true;
+                }
+
+                float right = c.x + pw * 0.5f;
+                if (right > half_total) {
+                    p.offset.x -= (right - half_total);
+                    if (p.velocity.x > 0.0f)
+                        p.velocity.x = -p.velocity.x * bounciness;
+                    any = true;
+                }
+            }
+
+            if (!any) break;
+        }
+    }
+    void trigger_fall()
+    {
+        auto grid = output->wset()->get_workspace_grid_size();
+        int gw = grid.width, gh = grid.height;
+        if ((int)panel_physics.size() != gw * gh)
+            panel_physics.resize(gw * gh);
+
+        for (int wy = 0; wy < gh; wy++) {
+            for (int wx = 0; wx < gw; wx++) {
+                int idx = wy * gw + wx;
+                auto& p = panel_physics[idx];
+
+                if (wx == selected_ws.x && wy == selected_ws.y)
+                    continue;
+
+                p.falling = true;
+                p.returning = false;
+                p.at_rest = false;
+
+                /* Random push — positive Y = downward */
+                float rx = ((float)(idx * 7 % 13) / 13.0f - 0.5f) * 3.0f;
+                float ry = ((float)(idx * 11 % 17) / 17.0f) * 1.0f;
+                p.velocity = glm::vec3(rx, ry, 0);
+                p.angular_vel = rx * 0.01f;
+                p.angular_vel_z = ry * 0.01f;
+            }
+        }
+        physics_triggered = true;
+    }
+
+
+
+    void trigger_return()
+    {
+        for (auto& p : panel_physics) {
+            if (p.falling || !p.at_rest) {
+                p.returning = true;
+                p.falling = false;
+                p.velocity = glm::vec3(0);
+            }
+        }
     }
 
     void generate_rounded_box_geometry()
@@ -1644,6 +1954,7 @@ void ensure_postprocess_fbos(int w, int h)
         if (zoom_state==ZoomState::ZOOMING_OUT ||
             zoom_state==ZoomState::OVERVIEW) return;
         zoom_state=ZoomState::ZOOMING_OUT;
+    trigger_return();
         zoom_anim.start(zoom_anim.current_pos,
             glm::vec3(0.0f,0.0f,calculate_overview_z()),0.45f);
         output->render->schedule_redraw();
@@ -2366,7 +2677,20 @@ void draw_box_silhouette(const glm::mat4& mvp)
                     float swing_angle = glm::radians(17.5f) *
                         std::sin(elapsed * 0.4f + swing_phase) * (1.0f - t);
                     sm = glm::rotate(sm, swing_angle, glm::vec3(0.0f, 1.0f, 0.0f));
-
+             /* Apply physics offset and rotation */
+                    if (idx < (int)panel_physics.size()) {
+                        auto& phys = panel_physics[idx];
+                        if (!phys.at_rest || phys.returning) {
+                            sm = glm::translate(sm, glm::vec3(
+                                phys.offset.x / (PANEL_SCALE * cached_aspect),
+                                phys.offset.y / PANEL_SCALE,
+                                phys.offset.z));
+                            sm = glm::rotate(sm, phys.angle,
+                                             glm::vec3(0.0f, 1.0f, 0.0f));
+                            sm = glm::rotate(sm, phys.angle_z,
+                                             glm::vec3(0.0f, 0.0f, 1.0f));
+                        }
+                    }
                     
 
                     panels.push_back({idx, wx, wy, pdepth, bright,
@@ -2699,6 +3023,7 @@ public:
         }
         reload_background();
         output->render->damage_whole();
+        trigger_return();
         return true;
     }
 
@@ -2850,6 +3175,7 @@ public:
                         if (is_zoomed_in()) {
                             zoom_out_to_overview();
                         } else {
+                              trigger_fall();
                             workspace_already_set=true;
                             right_click_target_ws=selected_ws;
                             zoom_target_ws=selected_ws;
@@ -2991,12 +3317,25 @@ public:
     /* ═════════════════════════════════════════════════════════════════════
      *  FIX 1: CONDITIONAL DAMAGE PRE_HOOK
      * ═════════════════════════════════════════════════════════════════════*/
-    wf::effect_hook_t pre_hook = [=]()
+wf::effect_hook_t pre_hook = [=]()
     {
+              bool any_physics = false;
+        for (auto& p : panel_physics) {
+            if (p.falling || p.returning || !p.at_rest) {
+                any_physics = true;
+                break;
+            }
+        }
+
+        if ( any_physics)    output->render->schedule_redraw();
         auto now=std::chrono::steady_clock::now();
         float dt=std::chrono::duration<float>(now-last_frame_time).count();
         last_frame_time=now;
         elapsed+=dt;
+
+        /* Physics update */
+        dt = std::min(dt, 0.033f);  /* cap to avoid explosion */
+        update_physics(dt);
 
         if (startup_frames > 0) {
             startup_frames--;
