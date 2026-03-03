@@ -155,82 +155,98 @@ static const char *box_color_vs = R"(
 #version 100
 attribute vec3 a_position;
 attribute vec3 a_normal;
+attribute vec2 a_edge_uv;
 uniform mat4 MVP;
 uniform mat4 u_model;
 uniform mat3 u_normal_matrix;
 varying vec3 v_normal_ws;
 varying vec3 v_pos_ws;
 varying vec3 v_pos_local;
+varying vec2 v_edge_uv;
+varying float v_depth;
 void main() {
     v_pos_local = a_position;
     v_pos_ws = (u_model * vec4(a_position, 1.0)).xyz;
     v_normal_ws = normalize(u_normal_matrix * a_normal);
+    v_edge_uv = a_edge_uv;
+    v_depth = -a_position.z;
     gl_Position = MVP * vec4(a_position, 1.0);
 })";
+
 static const char *box_color_fs = R"(
 #version 100
 precision highp float;
 varying vec3 v_normal_ws;
 varying vec3 v_pos_ws;
 varying vec3 v_pos_local;
+varying vec2 v_edge_uv;
+varying float v_depth;
 
-uniform vec3  u_color1;
-uniform vec3  u_color2;
 uniform float u_brightness;
-
-/* Dynamic lights */
-uniform vec3  u_cam_pos;        /* camera world position         */
-uniform vec3  u_light_pos;      /* primary light (follows cam)   */
-uniform vec3  u_light_color;    /* primary light color            */
-uniform vec3  u_accent_pos;     /* accent light (selected ws)    */
-uniform vec3  u_accent_color;   /* accent light color             */
+uniform vec3  u_cam_pos;
+uniform vec3  u_light_pos;
+uniform vec3  u_light_color;
+uniform vec3  u_accent_pos;
+uniform vec3  u_accent_color;
 uniform float u_time;
+uniform sampler2D u_desktop_tex;
+uniform float u_has_desktop;
+
+float fresnel(vec3 N, vec3 V, float power) {
+    return pow(1.0 - max(dot(N, V), 0.0), power);
+}
+
+vec3 subsurface(vec3 L, vec3 V, vec3 N, vec3 color, float thickness) {
+    vec3 scatter_dir = normalize(L + N * 0.5);
+    float scatter = max(0.0, dot(V, -scatter_dir));
+    scatter = pow(scatter, 3.0) * thickness;
+    return color * scatter * 0.4;
+}
 
 void main() {
-    /* Base color: gradient blend on local Y */
-    float blend = v_pos_local.y + 0.5;
-    vec3 base_color = mix(u_color1, u_color2, blend);
+    /* Sample edge color from desktop texture */
+    vec3 edge_color = texture2D(u_desktop_tex, v_edge_uv).rgb;
+
+    /* Darken slightly toward the back */
+    float depth_darken = mix(0.85, 0.55, v_depth * 10.0);
+    vec3 base_color = edge_color * depth_darken;
 
     vec3 N = normalize(v_normal_ws);
     vec3 V = normalize(u_cam_pos - v_pos_ws);
 
-    /* ── Ambient ─────────────────────────────────────── */
-    float ambient = 0.15;
-
-    /* ── Primary light (camera-tracking) ─────────────── */
     vec3  L1     = u_light_pos - v_pos_ws;
     float dist1  = length(L1);
     L1 = normalize(L1);
-    float atten1 = 1.0 / (1.0 + 0.05 * dist1 + 0.01 * dist1 * dist1);
-    float diff1  = max(dot(N, L1), 0.0);
+    float atten1 = 1.0 / (1.0 + 0.04 * dist1 + 0.008 * dist1 * dist1);
+    float wrap1  = max(0.0, (dot(N, L1) + 0.5) / 1.5);
     vec3  H1     = normalize(L1 + V);
-    float spec1  = pow(max(dot(N, H1), 0.0), 32.0);
+    float spec1  = pow(max(dot(N, H1), 0.0), 48.0);
 
-    /* ── Accent light (selected workspace) ───────────── */
     vec3  L2     = u_accent_pos - v_pos_ws;
     float dist2  = length(L2);
     L2 = normalize(L2);
-    float atten2 = 1.0 / (1.0 + 0.08 * dist2 + 0.02 * dist2 * dist2);
-    float diff2  = max(dot(N, L2), 0.0);
+    float atten2 = 1.0 / (1.0 + 0.06 * dist2 + 0.015 * dist2 * dist2);
+    float wrap2  = max(0.0, (dot(N, L2) + 0.5) / 1.5);
     vec3  H2     = normalize(L2 + V);
-    float spec2  = pow(max(dot(N, H2), 0.0), 24.0);
+    float spec2  = pow(max(dot(N, H2), 0.0), 32.0);
 
-    /* ── Subtle pulse on accent light ────────────────── */
     float pulse = 0.85 + 0.15 * sin(u_time * 2.0);
+    float rim = fresnel(N, V, 3.0) * 0.25;
+    vec3 rim_color = mix(u_light_color, u_accent_color, 0.5);
 
-    /* ── Rim light (edge glow facing camera) ─────────── */
-    float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.2;
+    vec3 sss1 = subsurface(L1, V, N, u_light_color, 0.6) * atten1;
+    vec3 sss2 = subsurface(L2, V, N, u_accent_color, 0.8) * atten2;
 
-    /* ── Combine ─────────────────────────────────────── */
+    float ambient = 0.15 + 0.05 * (N.y * 0.5 + 0.5);
+
     vec3 lighting = vec3(ambient);
-    lighting += (diff1 * 0.6 + spec1 * 0.3) * atten1 * u_light_color;
-    lighting += (diff2 * 0.4 + spec2 * 0.2) * atten2 * u_accent_color * pulse;
-    lighting += rim * vec3(1.0);
+    lighting += (wrap1 * 0.55 + spec1 * 0.35) * atten1 * u_light_color;
+    lighting += (wrap2 * 0.40 + spec2 * 0.25) * atten2 * u_accent_color * pulse;
+    lighting += rim * rim_color;
+    lighting += sss1 + sss2;
 
     vec3 col = base_color * lighting * u_brightness;
-
-    /* Subtle tone mapping to avoid blowout */
-    col = col / (col + vec3(1.0));
+    col = col / (col + vec3(0.9));
 
     gl_FragColor = vec4(col, 1.0);
 })";
@@ -1055,7 +1071,7 @@ void update_physics(float dt)
         }
     }
 
-    void generate_rounded_box_geometry()
+   void generate_rounded_box_geometry()
     {
         float hw = 0.5f, hh = 0.5f;
         float D = BOX_DEPTH;
@@ -1098,8 +1114,8 @@ void update_physics(float dt)
         std::vector<GLuint> fi;
 
         /* Center vertex */
-        fv.push_back(0.0f); fv.push_back(0.0f);   /* pos */
-        fv.push_back(0.5f); fv.push_back(0.5f);   /* uv  */
+        fv.push_back(0.0f); fv.push_back(0.0f);
+        fv.push_back(0.5f); fv.push_back(0.5f);
 
         for (int i = 0; i < N; i++) {
             fv.push_back(perim[i].x);
@@ -1130,146 +1146,56 @@ void update_physics(float dt)
             fi.size() * sizeof(GLuint), fi.data(), GL_STATIC_DRAW));
 
         /* ═══════════════════════════════════════════════════════════
-         *  SIDE STRIP + BACK FACE (pos3 + normal3)
-         *
-         *  Side: front perimeter → back perimeter with outward normals
-         *  Front bevel: curved transition from front face to side
-         *  Back bevel:  curved transition from side to back face
-         *  Back face:   flat rounded rect at z = -D
+         *  SIDES: straight extrusion with edge UVs
+         *  Each vertex: pos(3) + normal(3) + edge_uv(2) = 8 floats
+         *  UV maps to nearest desktop texture edge pixel
          * ═══════════════════════════════════════════════════════════*/
         std::vector<GLfloat> sv;
         std::vector<GLuint> si;
 
-        int bevel_segs = 4;
-        float bevel_r = D * 0.4f;  /* how much of the depth is curved */
-        float flat_depth = D - bevel_r * 2.0f;
-        if (flat_depth < 0.0f) {
-            bevel_r = D * 0.5f;
-            flat_depth = 0.0f;
-        }
+        float hw_uv = hw * 2.0f;
+        float hh_uv = hh * 2.0f;
 
-        /* For each perimeter point, generate a profile curve:
-         *   front face edge (z=0) → bevel out → straight side → bevel in → back face (z=-D)
-         *
-         *   Profile goes:
-         *     Ring 0: z=0,          normal = (0,0,1) blended with outward
-         *     Ring 1..bevel_segs:   front bevel curve
-         *     Ring bevel_segs+1:    straight side start (z = -bevel_r)
-         *     Ring bevel_segs+2:    straight side end   (z = -(D-bevel_r))
-         *     Ring bevel_segs+3..+3+bevel_segs: back bevel curve
-         *     Ring last:            z=-D, normal = (0,0,-1) blended with outward
-         */
-
-        int rings = 2 + bevel_segs * 2 + 2;  /* total rings in the profile */
-
-        struct Ring { float z_off; float nx_blend; float nz; };
-        std::vector<Ring> profile;
-
-        /* Front bevel */
-        for (int s = 0; s <= bevel_segs; s++) {
-            float t = (float)s / bevel_segs;
-            float angle = (float)M_PI * 0.5f * (1.0f - t);  /* 90° → 0° */
-            float bx = std::cos(angle) * bevel_r;
-            float bz = (1.0f - std::sin(angle)) * bevel_r;
-            /* Normal: blend between forward (0,0,1) and outward */
-            float n_out = std::cos(angle - (float)M_PI * 0.5f);
-            float n_fwd = std::sin(angle - (float)M_PI * 0.5f);
-            /* Actually compute from the curve tangent */
-            float tnx = std::sin(angle);   /* outward component */
-            float tnz = std::cos(angle);   /* forward component */
-            profile.push_back({-bz, tnx, tnz});
-        }
-
-        /* Straight side */
-        profile.push_back({-bevel_r, 1.0f, 0.0f});
-        if (flat_depth > 0.001f) {
-            profile.push_back({-(bevel_r + flat_depth), 1.0f, 0.0f});
-        }
-
-        /* Back bevel */
-        for (int s = 0; s <= bevel_segs; s++) {
-            float t = (float)s / bevel_segs;
-            float angle = (float)M_PI * 0.5f * t;  /* 0° → 90° */
-            float bz = bevel_r + flat_depth +
-                       (1.0f - std::cos(angle)) * bevel_r;
-            float tnx = std::cos(angle);
-            float tnz = -std::sin(angle);  /* pointing backward */
-            profile.push_back({-bz, tnx, tnz});
-        }
-
-        int num_rings = (int)profile.size();
-
-        /* Generate vertices: N perimeter points × num_rings rings */
-        for (int ring = 0; ring < num_rings; ring++) {
-            auto& pr = profile[ring];
-            for (int i = 0; i < N; i++) {
-                /* Position: perimeter XY + profile Z offset */
-                /* For bevel, push outward slightly based on profile */
-                float bevel_expand = 0.0f;
-                if (ring < (int)profile.size()) {
-                    /* The bevel curve pushes geometry inward from the edge
-                       to create the rounded profile */
-                    if (ring <= bevel_segs) {
-                        float t = (float)ring / bevel_segs;
-                        float angle = (float)M_PI * 0.5f * (1.0f - t);
-                        bevel_expand = -(bevel_r - std::cos(angle) * bevel_r);
-                    } else if (ring >= num_rings - bevel_segs - 1) {
-                        int br = ring - (num_rings - bevel_segs - 1);
-                        float t = (float)br / bevel_segs;
-                        float angle = (float)M_PI * 0.5f * t;
-                        bevel_expand = -(bevel_r - std::cos(angle) * bevel_r);
-                    }
-                }
-
-                float px = perim[i].x + perim[i].nx * bevel_expand;
-                float py = perim[i].y + perim[i].ny * bevel_expand;
-                float pz = pr.z_off;
-
-                /* Normal: combine perimeter outward with profile Z component */
-                float fnx = perim[i].nx * pr.nx_blend;
-                float fny = perim[i].ny * pr.nx_blend;
-                float fnz = pr.nz;
-                float nlen = std::sqrt(fnx*fnx + fny*fny + fnz*fnz);
-                if (nlen > 0.001f) { fnx /= nlen; fny /= nlen; fnz /= nlen; }
-
-                sv.push_back(px);  sv.push_back(py);  sv.push_back(pz);
-                sv.push_back(fnx); sv.push_back(fny); sv.push_back(fnz);
-            }
-        }
-
-        /* Side strip indices: connect adjacent rings */
-        for (int ring = 0; ring < num_rings - 1; ring++) {
-            for (int i = 0; i < N; i++) {
-                int next = (i + 1) % N;
-                int r0i = ring * N + i;
-                int r0n = ring * N + next;
-                int r1i = (ring + 1) * N + i;
-                int r1n = (ring + 1) * N + next;
-
-                si.push_back(r0i); si.push_back(r1i); si.push_back(r0n);
-                si.push_back(r0n); si.push_back(r1i); si.push_back(r1n);
-            }
-        }
-
-        /* Back face: triangle fan at z = -D with normal (0,0,-1) */
-        int back_center = (int)(sv.size() / 6);
-        sv.push_back(0.0f); sv.push_back(0.0f); sv.push_back(-D);
-        sv.push_back(0.0f); sv.push_back(0.0f); sv.push_back(-1.0f);
-
-        /* Back perimeter vertices (inset by bevel) */
-        float back_inset = bevel_r;  /* back bevel pulls edge inward */
+        /* Ring 0: front edge at z = 0 */
         for (int i = 0; i < N; i++) {
-            float px = perim[i].x - perim[i].nx * back_inset;
-            float py = perim[i].y - perim[i].ny * back_inset;
-            sv.push_back(px);   sv.push_back(py);   sv.push_back(-D);
-            sv.push_back(0.0f); sv.push_back(0.0f); sv.push_back(-1.0f);
+            float u = perim[i].x / hw_uv + 0.5f;
+            float v = perim[i].y / hh_uv + 0.5f;
+
+            sv.push_back(perim[i].x);
+            sv.push_back(perim[i].y);
+            sv.push_back(0.0f);
+            sv.push_back(perim[i].nx);
+            sv.push_back(perim[i].ny);
+            sv.push_back(0.0f);
+            sv.push_back(u);
+            sv.push_back(v);
         }
 
-        /* Back face triangles (reversed winding) */
+        /* Ring 1: back edge at z = -D */
         for (int i = 0; i < N; i++) {
-            si.push_back(back_center);
-            si.push_back(back_center + 1 + (i + 1) % N);
-            si.push_back(back_center + 1 + i);
+            float u = perim[i].x / hw_uv + 0.5f;
+            float v = perim[i].y / hh_uv + 0.5f;
+
+            sv.push_back(perim[i].x);
+            sv.push_back(perim[i].y);
+            sv.push_back(-D);
+            sv.push_back(perim[i].nx);
+            sv.push_back(perim[i].ny);
+            sv.push_back(0.0f);
+            sv.push_back(u);
+            sv.push_back(v);
+        }
+
+        /* Connect front ring to back ring */
+        for (int i = 0; i < N; i++) {
+            int next = (i + 1) % N;
+            int f0 = i;
+            int f1 = next;
+            int b0 = N + i;
+            int b1 = N + next;
+
+            si.push_back(f0); si.push_back(b0); si.push_back(f1);
+            si.push_back(f1); si.push_back(b0); si.push_back(b1);
         }
 
         sides_index_count = (int)si.size();
@@ -2208,13 +2134,13 @@ glm::vec2 world_to_screen_uv(const glm::vec3& world_pos,
         orb_program.deactivate();
     }
 
-    void draw_neon_edges(const glm::mat4& mvp, const glm::vec3& color)
+     void draw_neon_edges(const glm::mat4& mvp, const glm::vec3& color)
     {
         neon_edge_program.use(wf::TEXTURE_TYPE_RGBA);
         GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
         GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, box_sides_ibo));
 
-        const GLsizei stride = 6 * sizeof(GLfloat);
+        const GLsizei stride = 8 * sizeof(GLfloat);
         neon_edge_program.attrib_pointer("a_position", 3, stride, (void*)0);
         neon_edge_program.attrib_pointer("a_normal",   3, stride,
                                          (void*)(3 * sizeof(GLfloat)));
@@ -2225,13 +2151,13 @@ glm::vec2 world_to_screen_uv(const glm::vec3& world_pos,
         neon_edge_program.uniform1f("u_time", elapsed);
         neon_edge_program.uniform1f("u_intensity", 2.0f);
 
-        /* Draw expanded outline with front-face culling (shows only edges) */
         GL_CALL(glEnable(GL_CULL_FACE));
         GL_CALL(glCullFace(GL_FRONT));
         GL_CALL(glDepthMask(GL_FALSE));
-        GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE)); /* additive */
+        GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE));
 
-        GL_CALL(glDrawElements(GL_TRIANGLES, 30, GL_UNSIGNED_INT, nullptr));
+        GL_CALL(glDrawElements(GL_TRIANGLES, sides_index_count,
+            GL_UNSIGNED_INT, nullptr));
 
         GL_CALL(glDisable(GL_CULL_FACE));
         GL_CALL(glDepthMask(GL_TRUE));
@@ -2445,63 +2371,59 @@ struct DynamicLight {
     float time = 0.0f;
 };
 
-void draw_box_sides(const glm::mat4& mvp, const glm::mat4& model,
-                    float brightness,
-                    const glm::vec3& color1, const glm::vec3& color2,
-                    const DynamicLight& light)
-{
+   void draw_box_sides(const glm::mat4& mvp, const glm::mat4& model,
+                        float brightness,
+                        const glm::vec3& color1, const glm::vec3& color2,
+                        const DynamicLight& light,
+                        GLuint desktop_tex_id)
+    {
+        box_color_program.use(wf::TEXTURE_TYPE_RGBA);
+        GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
+        GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, box_sides_ibo));
 
-    GL_CALL(glEnable(GL_CULL_FACE));
-        GL_CALL(glCullFace(GL_BACK));
+        const GLsizei stride = 8 * sizeof(GLfloat);
+        box_color_program.attrib_pointer("a_position", 3, stride, (void*)0);
+        box_color_program.attrib_pointer("a_normal",   3, stride,
+                                         (void*)(3 * sizeof(GLfloat)));
+        box_color_program.attrib_pointer("a_edge_uv",  2, stride,
+                                         (void*)(6 * sizeof(GLfloat)));
 
-    box_color_program.use(wf::TEXTURE_TYPE_RGBA);
-    GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
-    GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, box_sides_ibo));
+        box_color_program.uniformMatrix4f("MVP", mvp);
+        box_color_program.uniformMatrix4f("u_model", model);
 
-    const GLsizei stride = 6 * sizeof(GLfloat);
-    box_color_program.attrib_pointer("a_position", 3, stride, (void*)0);
-    box_color_program.attrib_pointer("a_normal",   3, stride,
-                                     (void*)(3 * sizeof(GLfloat)));
+        glm::mat3 normal_mat = glm::mat3(glm::transpose(glm::inverse(model)));
+        GLint loc = glGetUniformLocation(
+            box_color_program.get_program_id(wf::TEXTURE_TYPE_RGBA),
+            "u_normal_matrix");
+        if (loc >= 0) {
+            GL_CALL(glUniformMatrix3fv(loc, 1, GL_FALSE, &normal_mat[0][0]));
+        }
 
-    box_color_program.uniformMatrix4f("MVP", mvp);
-    box_color_program.uniformMatrix4f("u_model", model);
+        box_color_program.uniform1f("u_brightness", brightness);
+        box_color_program.uniform3f("u_cam_pos",
+            light.cam_pos.x, light.cam_pos.y, light.cam_pos.z);
+        box_color_program.uniform3f("u_light_pos",
+            light.light_pos.x, light.light_pos.y, light.light_pos.z);
+        box_color_program.uniform3f("u_light_color",
+            light.light_color.x, light.light_color.y, light.light_color.z);
+        box_color_program.uniform3f("u_accent_pos",
+            light.accent_pos.x, light.accent_pos.y, light.accent_pos.z);
+        box_color_program.uniform3f("u_accent_color",
+            light.accent_color.x, light.accent_color.y, light.accent_color.z);
+        box_color_program.uniform1f("u_time", light.time);
 
-    /* Normal matrix = transpose(inverse(upper-left 3×3 of model)) */
-    glm::mat3 normal_mat = glm::mat3(glm::transpose(glm::inverse(model)));
-    /* uniformMatrix3f helper — if your OpenGL::program_t doesn't have one,
-       fall back to raw glUniformMatrix3fv */
-    GLint loc = glGetUniformLocation(
-        box_color_program.get_program_id(wf::TEXTURE_TYPE_RGBA),
-        "u_normal_matrix");
-    if (loc >= 0) {
-        GL_CALL(glUniformMatrix3fv(loc, 1, GL_FALSE, &normal_mat[0][0]));
-    }
+        GL_CALL(glActiveTexture(GL_TEXTURE0));
+        GL_CALL(glBindTexture(GL_TEXTURE_2D, desktop_tex_id));
+        box_color_program.uniform1i("u_desktop_tex", 0);
+        box_color_program.uniform1f("u_has_desktop", 1.0f);
 
-    box_color_program.uniform3f("u_color1", color1.r, color1.g, color1.b);
-    box_color_program.uniform3f("u_color2", color2.r, color2.g, color2.b);
-    box_color_program.uniform1f("u_brightness", brightness);
-
-    box_color_program.uniform3f("u_cam_pos",
-        light.cam_pos.x, light.cam_pos.y, light.cam_pos.z);
-    box_color_program.uniform3f("u_light_pos",
-        light.light_pos.x, light.light_pos.y, light.light_pos.z);
-    box_color_program.uniform3f("u_light_color",
-        light.light_color.x, light.light_color.y, light.light_color.z);
-    box_color_program.uniform3f("u_accent_pos",
-        light.accent_pos.x, light.accent_pos.y, light.accent_pos.z);
-    box_color_program.uniform3f("u_accent_color",
-        light.accent_color.x, light.accent_color.y, light.accent_color.z);
-    box_color_program.uniform1f("u_time", light.time);
-
-        /* Draw all side + back faces */
         GL_CALL(glDrawElements(GL_TRIANGLES, sides_index_count,
             GL_UNSIGNED_INT, nullptr));
 
-    GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
-    GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
-    box_color_program.deactivate();
-     GL_CALL(glDisable(GL_CULL_FACE));
-}
+        GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
+        GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
+        box_color_program.deactivate();
+    }
 
     /* ═════════════════════════════════════════════════════════════════════
      *  RENDER PASSES — 3D BOX VERSION
@@ -2536,7 +2458,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
     {
         silhouette_program.use(wf::TEXTURE_TYPE_RGBA);
 
-        /* Front face silhouette */
+        /* Front face */
         GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, panel_vbo));
         GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, panel_ibo));
         silhouette_program.attrib_pointer("a_position", 2,
@@ -2545,11 +2467,11 @@ void draw_box_silhouette(const glm::mat4& mvp)
         GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count,
             GL_UNSIGNED_INT, nullptr));
 
-        /* Sides + back silhouette */
+        /* Sides — stride is 8 floats */
         GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, box_sides_vbo));
         GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, box_sides_ibo));
         silhouette_program.attrib_pointer("a_position", 3,
-            6*sizeof(GLfloat), (void*)0);
+            8*sizeof(GLfloat), (void*)0);
         silhouette_program.uniformMatrix4f("MVP", mvp);
         GL_CALL(glDrawElements(GL_TRIANGLES, sides_index_count,
             GL_UNSIGNED_INT, nullptr));
@@ -2559,7 +2481,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
         silhouette_program.deactivate();
     }
 
-   void render_from_states(const wf::scene::render_instruction_t& data,
+ void render_from_states(const wf::scene::render_instruction_t& data,
         std::vector<WsRenderState>& states, int gw, int gh)
     {
         if (skip_first_render > 0) {
@@ -2568,7 +2490,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
         }
 
         data.pass->custom_gles_subpass([&]
-            {
+        {
             if (program.get_program_id(wf::TEXTURE_TYPE_RGBA)==0)
                 load_program();
 
@@ -2615,7 +2537,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
             dyn_light.accent_color = glm::mix(sel_c1, sel_c2, 0.5f) * 1.5f;
 
             /* Project mouse cursor to world XY at the orb Z plane */
-            float orb_z = -0.2f;  /* stays behind the cubes */
+            float orb_z = -0.2f;
             Ray mouse_ray = screen_to_world_ray(
                 last_cursor_pos.x, last_cursor_pos.y, output);
 
@@ -2673,11 +2595,12 @@ void draw_box_silhouette(const glm::mat4& mvp)
                         bright *= std::max(0.0f, 1.0f - fade);
                     }
 
-                               float swing_phase = (float)(wx * 3 + wy * 7) * 1.618f;
+                    float swing_phase = (float)(wx * 3 + wy * 7) * 1.618f;
                     float swing_angle = glm::radians(17.5f) *
                         std::sin(elapsed * 0.4f + swing_phase) * (1.0f - t);
                     sm = glm::rotate(sm, swing_angle, glm::vec3(0.0f, 1.0f, 0.0f));
-             /* Apply physics offset and rotation */
+
+                    /* Apply physics offset and rotation */
                     if (idx < (int)panel_physics.size()) {
                         auto& phys = panel_physics[idx];
                         if (!phys.at_rest || phys.returning) {
@@ -2691,7 +2614,6 @@ void draw_box_silhouette(const glm::mat4& mvp)
                                              glm::vec3(0.0f, 0.0f, 1.0f));
                         }
                     }
-                    
 
                     panels.push_back({idx, wx, wy, pdepth, bright,
                                       sm, vp * sm});
@@ -2704,8 +2626,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
                 });
 
             /* ═══════════════════════════════════════════════════════
-             *  OCCLUSION PASS: bright light + black cube silhouettes
-             *  This is what the god rays sample from
+             *  OCCLUSION PASS
              * ═══════════════════════════════════════════════════════*/
             GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, pp_occlude_fbo));
             GL_CALL(glViewport(0, 0, vp_w, vp_h));
@@ -2716,14 +2637,10 @@ void draw_box_silhouette(const glm::mat4& mvp)
             GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
             GL_CALL(glDisable(GL_DEPTH_TEST));
 
-            /* Draw a large bright disc at the light position */
             draw_light_disc(vp, orb_pos, dyn_light.accent_color, 1.8f);
-
-            /* Also a secondary one at the camera light */
             draw_light_disc(vp, dyn_light.light_pos,
                             glm::vec3(0.8f, 0.75f, 0.6f), 1.0f);
 
-            /* Now stamp black silhouettes of all cubes on top */
             GL_CALL(glEnable(GL_DEPTH_TEST));
             GL_CALL(glDepthFunc(GL_LESS));
             GL_CALL(glDepthMask(GL_TRUE));
@@ -2739,7 +2656,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
                 float swing_phase = (float)(zoom_target_ws.x * 3 +
                                             zoom_target_ws.y * 7) * 1.618f;
                 float swing_angle = glm::radians(17.5f) *
-                        std::sin(elapsed * 0.4f + swing_phase) * (1.0f - t);
+                    std::sin(elapsed * 0.4f + swing_phase) * (1.0f - t);
                 tmodel = glm::rotate(tmodel, swing_angle,
                                      glm::vec3(0.0f, 1.0f, 0.0f));
                 glm::mat4 tmvp = vp * tmodel;
@@ -2749,7 +2666,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
             GL_CALL(glDisable(GL_DEPTH_TEST));
 
             /* ═══════════════════════════════════════════════════════
-             *  GOD RAYS PASS: radial blur the occlusion texture
+             *  GOD RAYS PASS
              * ═══════════════════════════════════════════════════════*/
             glm::vec2 orb_screen_uv = world_to_screen_uv(orb_pos, vp, ow, oh);
             float edge_dist = std::min({orb_screen_uv.x, 1.0f - orb_screen_uv.x,
@@ -2759,7 +2676,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
             run_godrays_pass(orb_screen_uv, ray_intensity);
 
             /* ═══════════════════════════════════════════════════════
-             *  SCENE PASS: background + god rays + cubes + orbs
+             *  SCENE PASS
              * ═══════════════════════════════════════════════════════*/
             GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, pp_scene_fbo));
             GL_CALL(glViewport(0, 0, vp_w, vp_h));
@@ -2769,10 +2686,8 @@ void draw_box_silhouette(const glm::mat4& mvp)
             GL_CALL(glEnable(GL_BLEND));
             GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
 
-            /* Draw background */
             render_background_cached(vp_w, vp_h);
 
-            /* Blit god rays additively on top of background */
             GL_CALL(glBlendFunc(GL_ONE, GL_ONE));
             GL_CALL(glDepthMask(GL_FALSE));
             blit_program.use(wf::TEXTURE_TYPE_RGBA);
@@ -2781,11 +2696,6 @@ void draw_box_silhouette(const glm::mat4& mvp)
             blit_program.deactivate();
             GL_CALL(glDepthMask(GL_TRUE));
             GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
-
-            /* Draw the visible light orbs */
-      //      draw_light_orb(vp, orb_pos, dyn_light.accent_color, 1.5f);
-        //    draw_light_orb(vp, dyn_light.light_pos,
-          //                 glm::vec3(1.0f, 0.9f, 0.8f), 0.6f);
 
             /* ─── Draw cubes on top ────────────────────────────────── */
             GL_CALL(glEnable(GL_DEPTH_TEST));
@@ -2801,18 +2711,20 @@ void draw_box_silhouette(const glm::mat4& mvp)
                 glm::vec3 c1, c2;
                 workspace_colors(pd.wx, pd.wy, gw, c1, c2);
 
+                auto tex = wf::gles_texture_t::from_aux(st.fb);
+
                 draw_box_sides(pd.scatter_mvp, pd.scatter_model,
-                               pd.bright, c1, c2, dyn_light);
+                               pd.bright, c1, c2, dyn_light, tex.tex_id);
 
                 if (pd.wx == selected_ws.x && pd.wy == selected_ws.y) {
-             //       draw_neon_edges(pd.scatter_mvp, dyn_light.accent_color);
+                    draw_neon_edges(pd.scatter_mvp, dyn_light.accent_color);
                 }
 
-               float face_bright = ((pd.wx == selected_ws.x &&
+                float face_bright = ((pd.wx == selected_ws.x &&
                                       pd.wy == selected_ws.y) ||
                                      (pd.wx == zoom_target_ws.x &&
                                       pd.wy == zoom_target_ws.y))
-                                    ? 1.3f : 1.30f;
+                                    ? 1.3f : 1.3f;
 
                 GL_CALL(glBlendFunc(GL_ONE, GL_ZERO));
                 program.use(wf::TEXTURE_TYPE_RGBA);
@@ -2822,11 +2734,11 @@ void draw_box_silhouette(const glm::mat4& mvp)
                     4*sizeof(GLfloat), (void*)0);
                 program.attrib_pointer("uvPosition", 2,
                     4*sizeof(GLfloat), (void*)(2*sizeof(GLfloat)));
-                auto tex = wf::gles_texture_t::from_aux(st.fb);
                 GL_CALL(glBindTexture(GL_TEXTURE_2D, tex.tex_id));
                 program.uniformMatrix4f("MVP", pd.scatter_mvp);
                 program.uniform1f("u_brightness", face_bright);
-                GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count, GL_UNSIGNED_INT, nullptr));
+                GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count,
+                    GL_UNSIGNED_INT, nullptr));
                 GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
                 GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
                 GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
@@ -2837,7 +2749,6 @@ void draw_box_silhouette(const glm::mat4& mvp)
             if (target_idx >= 0) {
                 auto& st = states[target_idx];
                 if (st.allocated) {
-                   
                     glm::mat4 model = cached_models[target_idx];
 
                     float swing_phase = (float)(zoom_target_ws.x * 3 +
@@ -2853,31 +2764,29 @@ void draw_box_silhouette(const glm::mat4& mvp)
                     workspace_colors(zoom_target_ws.x, zoom_target_ws.y,
                                      gw, c1, c2);
 
-                    draw_box_sides(mvp, model, 1.0f, c1, c2, dyn_light);
-               //     draw_neon_edges(mvp, dyn_light.accent_color);
+                    auto tex = wf::gles_texture_t::from_aux(st.fb);
 
-                   /* Front face — raw desktop, no lighting */
-                GL_CALL(glBlendFunc(GL_ONE, GL_ZERO));  /* fully opaque, no blending */
+                    draw_box_sides(mvp, model, 1.0f, c1, c2,
+                                   dyn_light, tex.tex_id);
+                    draw_neon_edges(mvp, dyn_light.accent_color);
 
-                program.use(wf::TEXTURE_TYPE_RGBA);
-                GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, panel_vbo));
-                GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, panel_ibo));
-                program.attrib_pointer("position",   2,
-                    4*sizeof(GLfloat), (void*)0);
-                program.attrib_pointer("uvPosition", 2,
-                    4*sizeof(GLfloat), (void*)(2*sizeof(GLfloat)));
-                auto tex = wf::gles_texture_t::from_aux(st.fb);
-                GL_CALL(glBindTexture(GL_TEXTURE_2D, tex.tex_id));
-                program.uniformMatrix4f("MVP",mvp);  /* or mvp for target */
-                GL_CALL(glEnable(GL_POLYGON_OFFSET_FILL));
-                GL_CALL(glPolygonOffset(-1.0f, -1.0f));
-                GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count, GL_UNSIGNED_INT, nullptr));
-
-                GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));  /* restore */
-
-                GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
-                GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
-                program.deactivate();
+                    GL_CALL(glBlendFunc(GL_ONE, GL_ZERO));
+                    program.use(wf::TEXTURE_TYPE_RGBA);
+                    GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, panel_vbo));
+                    GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, panel_ibo));
+                    program.attrib_pointer("position",   2,
+                        4*sizeof(GLfloat), (void*)0);
+                    program.attrib_pointer("uvPosition", 2,
+                        4*sizeof(GLfloat), (void*)(2*sizeof(GLfloat)));
+                    GL_CALL(glBindTexture(GL_TEXTURE_2D, tex.tex_id));
+                    program.uniformMatrix4f("MVP", mvp);
+                    program.uniform1f("u_brightness", 1.0f);
+                    GL_CALL(glDrawElements(GL_TRIANGLES, front_index_count,
+                        GL_UNSIGNED_INT, nullptr));
+                    GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+                    GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
+                    GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
+                    program.deactivate();
                 }
             }
 
@@ -2899,7 +2808,7 @@ void draw_box_silhouette(const glm::mat4& mvp)
             GL_CALL(glDisable(GL_DEPTH_TEST));
             GL_CALL(glEnable(GL_BLEND));
 
-composite_program.use(wf::TEXTURE_TYPE_RGBA);
+            composite_program.use(wf::TEXTURE_TYPE_RGBA);
 
             GL_CALL(glActiveTexture(GL_TEXTURE0));
             GL_CALL(glBindTexture(GL_TEXTURE_2D, pp_scene_tex));
@@ -2917,7 +2826,7 @@ composite_program.use(wf::TEXTURE_TYPE_RGBA);
             GL_CALL(glBindTexture(GL_TEXTURE_2D, pp_occlude_tex));
             composite_program.uniform1i("u_occlude", 3);
 
-            composite_program.uniform1f("u_godray_strength", 0.5f);
+            composite_program.uniform1f("u_godray_strength", 0.0f);
             composite_program.uniform1f("u_bloom_strength", 0.5f);
             composite_program.uniform1f("u_vignette", 0.8f);
 
